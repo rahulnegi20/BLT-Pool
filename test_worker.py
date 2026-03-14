@@ -4972,7 +4972,7 @@ class TestHandleAddMentor(unittest.TestCase):
         self.assertEqual(resp.status, 400)
         import json as _json
         data = _json.loads(resp.body)
-        self.assertIn("does not exist", data["error"])
+        self.assertIn("not found", data["error"])
 
     def test_duplicate_mentor_returns_409(self):
         """If the github_username is already in the mentor pool, return 409 Conflict."""
