@@ -5241,25 +5241,6 @@ async def _handle_add_mentor(request, env) -> "Response":
     if referred_by and not await _verify_gh_user_exists(referred_by, env):
         return _json({"error": f"Referred-by username '{referred_by}' was not found on GitHub"}, 400)
 
-    try:
-        user_resp = await fetch(
-            f"https://api.github.com/users/{github_username}",
-            method="GET",
-            headers=Headers.new({
-                "Accept": "application/vnd.github+json",
-                "User-Agent": "BLT-GitHub-App/1.0",
-                "X-GitHub-Api-Version": "2022-11-28",
-            }.items())
-        )
-        if user_resp.status == 404:
-            return _json({"error": f"GitHub user '{github_username}' does not exist"}, 400)
-        elif user_resp.status != 200:
-            console.error(f"[MentorPool] GitHub API error checking user {github_username}: status {user_resp.status}")
-            return _json({"error": "Failed to validate GitHub username. Please try again later."}, 500)
-    except Exception as exc:
-        console.error(f"[MentorPool] Error validating GitHub user {github_username}: {exc}")
-        return _json({"error": "Failed to validate GitHub username. Please try again later."}, 500)
-
     db = _d1_binding(env)
     if not db:
         return _json({"error": "Database not available"}, 500)

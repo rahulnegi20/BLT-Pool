@@ -4948,14 +4948,13 @@ class TestHandleAddMentor(unittest.TestCase):
         async def _inner():
             import contextlib
             mock_db = MagicMock()
-            mock_fetch_response = types.SimpleNamespace(status=200 if gh_user_exists else 404)
             mock_existing = [{"github_username": body.get("github_username", "").lstrip("@")}] if already_exists else []
             add_mock = AsyncMock(side_effect=RuntimeError("db error")) if db_raises else AsyncMock()
 
             with contextlib.ExitStack() as stack:
                 stack.enter_context(patch.object(_worker, "_d1_binding", return_value=mock_db))
                 stack.enter_context(patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()))
-                stack.enter_context(patch.object(_worker, "fetch", new=AsyncMock(return_value=mock_fetch_response)))
+                stack.enter_context(patch.object(_worker, "_verify_gh_user_exists", new=AsyncMock(return_value=gh_user_exists)))
                 stack.enter_context(patch.object(_worker, "_d1_all", new=AsyncMock(return_value=mock_existing)))
                 stack.enter_context(patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda *a: None, log=lambda *a: None)))
                 stack.enter_context(patch.object(_worker, "_d1_add_mentor", new=add_mock))
