@@ -32,6 +32,8 @@ import re
 import time
 import traceback
 from typing import Optional, Tuple
+from urllib.parse import quote, urlparse
+import asyncio
 
 from js import Headers, Response, console, fetch  # Cloudflare Workers JS bindings
 
@@ -60,6 +62,7 @@ from controllers.mentor_commands import _assign_mentor_to_issue, handle_mentor_c
 from controllers.peer_review import _is_excluded_reviewer, get_valid_reviewers, ensure_label_exists, update_peer_review_labels, check_peer_review_and_comment, handle_pull_request_review, handle_pull_request_for_review
 from controllers.api import _verify_gh_user_exists, _handle_admin_reset
 from services.mentor_seed import INITIAL_MENTORS
+from checks_api import build_update_check_run_payloads
 _INITIAL_MENTORS = INITIAL_MENTORS
 
 def _admin_path(env) -> str:
