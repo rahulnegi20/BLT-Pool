@@ -143,6 +143,12 @@ async def _ensure_leaderboard_schema(db) -> None:
             PRIMARY KEY (org, github_username)
         )
     """)
+    await _d1_run(db, """
+        CREATE TABLE IF NOT EXISTS leaderboard_processed_comments (
+            comment_id INTEGER PRIMARY KEY,
+            processed_at INTEGER NOT NULL
+        )
+    """)
 
 
 # ---------------------------------------------------------------------------
@@ -388,13 +394,44 @@ async def _track_comment_in_d1(payload: dict, env) -> None:
         return
     org = (payload.get("repository") or {}).get("owner", {}).get("login", "")
     login = user.get("login", "")
+    comment_id = comment.get("id")
     created_at = comment.get("created_at")
-    if not (org and login):
+    if not (org and login and comment_id):
         return
 
     await _ensure_leaderboard_schema(db)
+
+    result = await _d1_run(
+        db,
+        """
+        INSERT INTO leaderboard_processed_comments (comment_id, processed_at)
+        VALUES (?, ?)
+        ON CONFLICT (comment_id) DO NOTHING
+        """,
+        (comment_id, int(time.time())),
+    )
+    changes = 0
+    if isinstance(result, dict):
+        changes = int((result.get("meta") or {}).get("changes") or 0)
+    else:
+        meta = getattr(result, "meta", None)
+        if meta is not None:
+            changes = int(getattr(meta, "changes", 0) or 0)
+
+    if changes == 0:
+        console.log(f"[D1] Skipping duplicate comment_id={comment_id}")
+        return
+
     mk = _month_key(_parse_github_timestamp(created_at) if created_at else int(time.time()))
-    await _d1_inc_monthly(db, org, mk, login, "comments", 1)
+    try:
+        await _d1_inc_monthly(db, org, mk, login, "comments", 1)
+    except Exception:
+        await _d1_run(
+            db,
+            "DELETE FROM leaderboard_processed_comments WHERE comment_id = ?",
+            (comment_id,),
+        )
+        raise
 
 
 async def _track_review_in_d1(payload: dict, env) -> None:
@@ -706,7 +743,7 @@ async def _backfill_repo_month_if_needed(
         closed_page += 1
 
     if len(merged_prs_for_review) < MAX_REVIEW_BACKFILL:
-        tracked_merged_rows = await _d1_all(db, "SELECT pr_number, author_login FROM leaderboard_pr_state WHERE org = ? AND repo = ? AND merged = 1", (owner, repo_name))
+        tracked_merged_rows = await _d1_all(db, "SELECT pr_number, author_login FROM leaderboard_pr_state WHERE org = ? AND repo = ? AND merged = 1 AND closed_at >= ? AND closed_at <= ?", (owner, repo_name, start_ts, end_ts))
         newly_added = {pr_num for pr_num, _ in merged_prs_for_review}
         for row in (tracked_merged_rows or []):
             if len(merged_prs_for_review) >= MAX_REVIEW_BACKFILL:

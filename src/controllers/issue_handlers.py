@@ -111,6 +111,42 @@ async def handle_issue_comment(payload: dict, token: str, env=None) -> None:
         elif command == REMATCH_COMMAND:
             await handle_mentor_rematch(owner, repo, issue, login, token, mentors_config, env=env)
 
+async def _get_last_assign_requester(
+    owner: str, repo: str, num: int, token: str
+) -> Optional[str]:
+    """Return the login of the last human who commented ``/assign`` on the issue, or None."""
+    try:
+        page = 1
+        per_page = 100
+        while True:
+            resp = await github_api(
+                "GET",
+                f"/repos/{owner}/{repo}/issues/{num}/comments"
+                f"?per_page={per_page}&page={page}&sort=created&direction=desc",
+                token,
+            )
+            if resp.status != 200:
+                return None
+            comments = json.loads(await resp.text())
+            if not comments:
+                break
+            for c in comments:
+                user = c.get("user") or {}
+                body = (c.get("body") or "").strip()
+                login = user.get("login", "")
+                if not login or not _is_human(user):
+                    continue
+                from core.github_client import _extract_command  # noqa: PLC0415
+                if _extract_command(body) == ASSIGN_COMMAND:
+                    return login
+            if len(comments) < per_page:
+                break
+            page += 1
+    except Exception:
+        pass
+    return None
+
+
 async def _assign(
     owner: str, repo: str, issue: dict, login: str, token: str
 ) -> None:
@@ -189,7 +225,8 @@ async def _approve(
 ) -> None:
     """Handle the ``/approve`` command (triage reviewer approves an issue for assignment).
 
-    Only TRIAGE_REVIEWER is authorised. Adds the 'help wanted' label and assigns the opener.
+    Only TRIAGE_REVIEWER is authorised. Adds the 'help wanted' label and assigns the last
+    requester (or the opener if no prior /assign was found).
     """
     num = issue["number"]
     if login.lower() != TRIAGE_REVIEWER.lower():
@@ -209,18 +246,19 @@ async def _approve(
         token,
         {"labels": [HELP_WANTED_LABEL]},
     )
-    # Assign the opener, respecting MAX_ASSIGNEES.
-    opener = issue.get("user", {}).get("login", "")
+    # Prefer the last person who requested assignment; fall back to opener.
+    last_requester = await _get_last_assign_requester(owner, repo, num, token)
+    assignee = last_requester or (issue.get("user") or {}).get("login", "")
     opener_assigned = False
     assignment_note = ""
-    if opener:
+    if assignee:
         assignees = issue.get("assignees") or []
         assignee_logins = {
             a.get("login")
             for a in assignees
             if isinstance(a, dict) and a.get("login")
         }
-        if opener in assignee_logins:
+        if assignee in assignee_logins:
             opener_assigned = True
         elif len(assignee_logins) >= MAX_ASSIGNEES:
             assignment_note = (
@@ -237,11 +275,11 @@ async def _approve(
                 "POST",
                 f"/repos/{owner}/{repo}/issues/{num}/assignees",
                 token,
-                {"assignees": [opener]},
+                {"assignees": [assignee]},
             )
             opener_assigned = True
-    if opener and opener_assigned:
-        assignment_text = f"@{opener} You have been assigned — good luck! 🚀\n\n"
+    if assignee and opener_assigned:
+        assignment_text = f"@{assignee} You have been assigned — good luck! 🚀\n\n"
     elif assignment_note:
         assignment_text = assignment_note + "\n\n"
     else:

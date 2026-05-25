@@ -2353,10 +2353,10 @@ class TestTrackingOperations(unittest.TestCase):
         ])
         inc_mock = AsyncMock()
 
-        with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
-            with patch.object(_worker, "_d1_run", new=d1_run_mock):
-                with patch.object(_worker, "_d1_inc_monthly", new=inc_mock):
-                    with patch.object(_worker, "console",
+        with patch("models.leaderboard._ensure_leaderboard_schema", new=AsyncMock()):
+            with patch("models.leaderboard._d1_run", new=d1_run_mock):
+                with patch("models.leaderboard._d1_inc_monthly", new=inc_mock):
+                    with patch("worker.console",
                                       new=types.SimpleNamespace(log=lambda x: None,
                                                                  error=lambda x: None)):
                         env = types.SimpleNamespace(LEADERBOARD_DB=object())
@@ -2398,10 +2398,10 @@ class TestTrackingOperations(unittest.TestCase):
         ])
         inc_mock = AsyncMock(side_effect=[Exception("transient DB error"), None])
 
-        with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
-            with patch.object(_worker, "_d1_run", new=d1_run_mock):
-                with patch.object(_worker, "_d1_inc_monthly", new=inc_mock):
-                    with patch.object(_worker, "console",
+        with patch("models.leaderboard._ensure_leaderboard_schema", new=AsyncMock()):
+            with patch("models.leaderboard._d1_run", new=d1_run_mock):
+                with patch("models.leaderboard._d1_inc_monthly", new=inc_mock):
+                    with patch("worker.console",
                                       new=types.SimpleNamespace(log=lambda x: None,
                                                                  error=lambda x: None)):
                         env = types.SimpleNamespace(LEADERBOARD_DB=object())
@@ -3582,12 +3582,12 @@ class TestBackfillReviewCredits(unittest.TestCase):
                     return self._make_api_response(closed_prs)
                 return self._make_api_response([])
 
-            with patch.object(_worker, "github_api", new=_mock_api):
-                with patch.object(_worker, "_ensure_leaderboard_schema", new=AsyncMock()):
-                    with patch.object(_worker, "_d1_all", new=_capturing_d1_all):
-                        with patch.object(_worker, "_d1_run", new=AsyncMock(return_value={"success": True})):
-                            with patch.object(_worker, "_d1_inc_monthly", new=AsyncMock()):
-                                with patch.object(_worker, "console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
+            with patch("models.leaderboard.github_api", new=_mock_api):
+                with patch("models.leaderboard._ensure_leaderboard_schema", new=AsyncMock()):
+                    with patch("models.leaderboard._d1_all", new=_capturing_d1_all):
+                        with patch("models.leaderboard._d1_run", new=AsyncMock(return_value={"success": True})):
+                            with patch("models.leaderboard._d1_inc_monthly", new=AsyncMock()):
+                                with patch("models.leaderboard.console", new=types.SimpleNamespace(error=lambda x: None, log=lambda x: None)):
                                     await _worker._backfill_repo_month_if_needed(
                                         "OWASP-BLT", "test-repo", "tok", env,
                                         month_key="2026-03", start_ts=start_ts, end_ts=end_ts,

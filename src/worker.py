@@ -63,14 +63,259 @@ from controllers.peer_review import _is_excluded_reviewer, get_valid_reviewers, 
 from controllers.api import _verify_gh_user_exists, _handle_admin_reset
 from services.mentor_seed import INITIAL_MENTORS
 from checks_api import build_update_check_run_payloads
+from controllers.referral import (
+    _extract_mentions, _user_has_prior_activity, _is_valid_human_referree,
+    _format_referral_rank_comment, _process_referral_mentions,
+    MAX_REFERRAL_MENTIONS_PER_COMMENT, REFERRAL_MARKER,
+    _d1_record_referral, _d1_get_referral_count, _d1_get_referral_leaderboard,
+)
 _INITIAL_MENTORS = INITIAL_MENTORS
 
 def _admin_path(env) -> str:
     return getattr(env, "ADMIN_PATH", "/admin")
 
 
+async def _get_last_assign_requester(
+    owner: str, repo: str, num: int, token: str
+) -> Optional[str]:
+    """Return the login of the last human who commented ``/assign`` on the issue, or None."""
+    try:
+        page = 1
+        per_page = 100
+        while True:
+            resp = await github_api(
+                "GET",
+                f"/repos/{owner}/{repo}/issues/{num}/comments"
+                f"?per_page={per_page}&page={page}&sort=created&direction=desc",
+                token,
+            )
+            if resp.status != 200:
+                return None
+            comments = json.loads(await resp.text())
+            if not comments:
+                break
+            for c in comments:
+                user = c.get("user") or {}
+                body = (c.get("body") or "").strip()
+                login = user.get("login", "")
+                if not login or not _is_human(user):
+                    continue
+                if _extract_command(body) == ASSIGN_COMMAND:
+                    return login
+            if len(comments) < per_page:
+                break
+            page += 1
+    except Exception:
+        pass
+    return None
+
+
+async def _approve(
+    owner: str, repo: str, issue: dict, login: str, token: str
+) -> None:
+    """Handle the ``/approve`` command.
+
+    Only TRIAGE_REVIEWER is authorised. Prefers the last /assign requester as
+    the assignee; falls back to the issue opener if no prior request exists.
+    """
+    from controllers.issue_handlers import (  # noqa: PLC0415
+        TRIAGE_REVIEWER, HELP_WANTED_LABEL, MAX_ASSIGNEES, NEEDS_APPROVAL_LABEL
+    )
+    num = issue["number"]
+    if login.lower() != TRIAGE_REVIEWER.lower():
+        await create_comment(
+            owner, repo, num,
+            f"@{login} Only @{TRIAGE_REVIEWER} can approve issues.",
+            token,
+        )
+        return
+    if issue.get("pull_request") or issue.get("state") == "closed":
+        return
+    await github_api(
+        "POST",
+        f"/repos/{owner}/{repo}/issues/{num}/labels",
+        token,
+        {"labels": [HELP_WANTED_LABEL]},
+    )
+    last_requester = await _get_last_assign_requester(owner, repo, num, token)
+    assignee = last_requester or (issue.get("user") or {}).get("login", "")
+    opener_assigned = False
+    assignment_note = ""
+    if assignee:
+        assignees = issue.get("assignees") or []
+        assignee_logins = {
+            a.get("login")
+            for a in assignees
+            if isinstance(a, dict) and a.get("login")
+        }
+        if assignee in assignee_logins:
+            opener_assigned = True
+        elif len(assignee_logins) >= MAX_ASSIGNEES:
+            assignment_note = (
+                "However, this issue already has the maximum number of assignees, "
+                "so the opener was not additionally assigned."
+            )
+        elif assignee_logins:
+            assignment_note = (
+                "Note: this issue already has an assignee, so the opener was not "
+                "automatically assigned."
+            )
+        else:
+            await github_api(
+                "POST",
+                f"/repos/{owner}/{repo}/issues/{num}/assignees",
+                token,
+                {"assignees": [assignee]},
+            )
+            opener_assigned = True
+    if assignee and opener_assigned:
+        assignment_text = f"@{assignee} You have been assigned — good luck! 🚀\n\n"
+    elif assignment_note:
+        assignment_text = assignment_note + "\n\n"
+    else:
+        assignment_text = ""
+    await create_comment(
+        owner, repo, num,
+        f"✅ This issue has been approved by @{login}!\n\n"
+        + assignment_text
+        + f'The `"{HELP_WANTED_LABEL}"` label has been added so others can also use '
+        f"`/assign` to claim this issue.",
+        token,
+    )
+
+
+async def _user_has_prior_activity(owner: str, username: str, token: str) -> bool:
+    """Return True if *username* has any prior activity in the *owner* org.
+
+    Fails closed: non-200 responses are treated as "activity present" to
+    prevent transient API errors from inflating referral counts.
+    """
+    base = f"org:{owner}+fork:false"
+    u = username
+
+    # 1) Authored issues/PRs
+    resp = await github_api("GET", f"/search/issues?q={base}+author:{u}&per_page=1", token)
+    if resp.status != 200:
+        console.error(
+            f"[Referral] Search API returned {resp.status} for {u} in {base}; "
+            "treating as active to fail closed"
+        )
+        return True
+    data = json.loads(await resp.text())
+    if int(data.get("total_count") or 0) > 0:
+        return True
+
+    # 2) Comments anywhere in the org
+    resp2 = await github_api("GET", f"/search/issues?q={base}+commenter:{u}&per_page=1", token)
+    if resp2.status != 200:
+        return True
+    data2 = json.loads(await resp2.text())
+    return int(data2.get("total_count") or 0) > 0
+
+
+async def _process_referral_mentions(
+    owner: str,
+    repo: str,
+    issue_number: int,
+    commenter: str,
+    body: str,
+    token: str,
+    env,
+) -> None:
+    """Detect @-mentions of new contributors and record referrals in D1."""
+    import asyncio as _asyncio  # noqa: PLC0415
+
+    db = _d1_binding(env)
+    if not db:
+        return
+
+    mentions = _extract_mentions(body)
+    if not mentions:
+        return
+
+    mentions = [m for m in mentions if m != commenter.lower()]
+    if not mentions:
+        return
+
+    if len(mentions) > MAX_REFERRAL_MENTIONS_PER_COMMENT:
+        mentions = mentions[:MAX_REFERRAL_MENTIONS_PER_COMMENT]
+
+    filtered = []
+    for m in mentions:
+        try:
+            if await _is_valid_human_referree(m, token):
+                filtered.append(m)
+        except Exception:
+            pass
+    mentions = list(dict.fromkeys(filtered))
+    if not mentions:
+        return
+
+    await _ensure_leaderboard_schema(db)
+    mk = _month_key()
+    new_referrals = []
+
+    await _asyncio.sleep(5)
+
+    for mentioned in mentions:
+        try:
+            already_active = await _user_has_prior_activity(owner, mentioned, token)
+            if already_active:
+                continue
+            recorded = await _d1_record_referral(db, owner, commenter, mentioned, repo, issue_number, mk)
+            if recorded:
+                new_referrals.append(mentioned)
+        except Exception as exc:
+            console.error(f"[Referral] Error processing mention @{mentioned}: {exc}")
+
+    if not new_referrals:
+        return
+
+    try:
+        total = await _d1_get_referral_count(db, owner, commenter, mk)
+        leaderboard = await _d1_get_referral_leaderboard(db, owner, mk)
+        comment_body = _format_referral_rank_comment(commenter, total, leaderboard)
+        await create_comment(owner, repo, issue_number, comment_body, token)
+    except Exception as exc:
+        console.error(f"[Referral] Failed to post congratulation comment: {exc}")
+
+
+async def handle_issue_comment(payload: dict, token: str, env=None, ctx=None) -> None:
+    """Issue comment handler — extends issue_handlers version with ctx/referral support.
+
+    When ``ctx`` (Cloudflare ExecutionContext) is provided, the referral
+    processing is deferred via ``ctx.waitUntil()`` so it doesn't block the
+    webhook response.  When ``ctx=None`` (unit tests / non-Workers environments)
+    it is awaited inline.
+    """
+    from controllers.issue_handlers import handle_issue_comment as _base_handle_issue_comment  # noqa: PLC0415
+    from controllers.issue_handlers import _is_human as _is_human_check  # noqa: PLC0415
+
+    # Delegate the core command handling to the controller.
+    await _base_handle_issue_comment(payload, token, env=env)
+
+    # Trigger referral processing for human comments.
+    comment = payload.get("comment") or {}
+    issue = payload.get("issue") or {}
+    if not _is_human(comment.get("user") or {}):
+        return
+    body = (comment.get("body") or "").strip()
+    owner = (payload.get("repository") or {}).get("owner", {}).get("login", "")
+    repo = (payload.get("repository") or {}).get("name", "")
+    issue_number = issue.get("number")
+    commenter = (comment.get("user") or {}).get("login", "")
+    if not (owner and repo and issue_number and commenter and body):
+        return
+
+    coro = _process_referral_mentions(owner, repo, issue_number, commenter, body, token, env)
+    if ctx is not None:
+        ctx.waitUntil(coro)
+    else:
+        await coro
+
+
 async def check_unresolved_conversations(payload, token):
-    """Check for unresolved PR review threads and update a GitHub check-run + PR comment."""
+    """Add label, create a check run, and post a comment if PR has unresolved review conversations."""
     pr = payload.get("pull_request")
     if not pr:
         return
@@ -85,7 +330,9 @@ async def check_unresolved_conversations(payload, token):
       repository(owner: $owner, name: $repo) {
         pullRequest(number: $number) {
           reviewThreads(first: 100) {
-            nodes { isResolved }
+            nodes {
+              isResolved
+            }
           }
         }
       }
@@ -115,77 +362,28 @@ async def check_unresolved_conversations(payload, token):
     if result.get("errors") or pull_request is None:
         console.error(f"[BLT] GraphQL reviewThreads query returned errors: {result.get('errors')}")
         return
-    threads = pull_request.get("reviewThreads", {}).get("nodes", [])
+    threads = (
+        pull_request
+        .get("reviewThreads", {})
+        .get("nodes", [])
+    )
+
+    unresolved = any(not t.get("isResolved", True) for t in threads)
+
     unresolved_count = sum(not t.get("isResolved", True) for t in threads)
-    unresolved = unresolved_count > 0
 
-    # -----------------------------------------------------------------------
-    # Check-run management
-    # -----------------------------------------------------------------------
-    existing_check_run_id = None
-    if head_sha:
-        cr_resp = await github_api(
-            "GET",
-            f"/repos/{owner}/{repo}/commits/{head_sha}/check-runs?check_name={UNRESOLVED_CONVERSATIONS_CHECK_NAME}",
-            token,
-        )
-        if cr_resp.status == 200:
-            cr_data = json.loads(await cr_resp.text())
-            runs = cr_data.get("check_runs", [])
-            if runs:
-                existing_check_run_id = runs[0]["id"]
-
-    import time as _time
-    cr_payload = {
-        "name": UNRESOLVED_CONVERSATIONS_CHECK_NAME,
-        "head_sha": head_sha,
-        "status": "completed",
-        "conclusion": "failure" if unresolved else "success",
-        "completed_at": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
-        "output": {
-            "title": f"{unresolved_count} unresolved conversation(s)" if unresolved else "All conversations resolved",
-            "summary": f"There are {unresolved_count} unresolved review thread(s)." if unresolved else "No unresolved review threads.",
-        },
-    }
-
-    if existing_check_run_id:
-        await github_api("PATCH", f"/repos/{owner}/{repo}/check-runs/{existing_check_run_id}", token, cr_payload)
-    else:
-        await github_api("POST", f"/repos/{owner}/{repo}/check-runs", token, cr_payload)
-
-    # -----------------------------------------------------------------------
-    # PR comment management
-    # -----------------------------------------------------------------------
-    existing_comment_id = None
-    comments_resp = await github_api("GET", f"/repos/{owner}/{repo}/issues/{number}/comments?per_page=100", token)
-    if comments_resp.status == 200:
-        for c in json.loads(await comments_resp.text()):
-            if UNRESOLVED_CONVERSATIONS_MARKER in (c.get("body") or ""):
-                existing_comment_id = c["id"]
-                break
-
-    if unresolved:
-        body = (
-            f"{UNRESOLVED_CONVERSATIONS_MARKER}\n"
-            f"⚠️ This PR has **{unresolved_count}** unresolved review conversation(s). "
-            "Please resolve them before merging."
-        )
-        if existing_comment_id:
-            await github_api("PATCH", f"/repos/{owner}/{repo}/issues/comments/{existing_comment_id}", token, {"body": body})
-        else:
-            await create_comment(owner, repo, number, body, token)
-    else:
-        if existing_comment_id:
-            await github_api("DELETE", f"/repos/{owner}/{repo}/issues/comments/{existing_comment_id}", token)
-
-    # -----------------------------------------------------------------------
-    # Label management
-    # -----------------------------------------------------------------------
-    from urllib.parse import quote
-    resp_labels = await github_api("GET", f"/repos/{owner}/{repo}/issues/{number}/labels", token)
+    # Remove any existing unresolved-conversations labels
+    from urllib.parse import quote  # noqa: PLC0415
+    from controllers.pr_handlers import _ensure_label_exists  # noqa: PLC0415
+    resp_labels = await github_api(
+        "GET",
+        f"/repos/{owner}/{repo}/issues/{number}/labels",
+        token,
+    )
     if resp_labels.status == 200:
-        for lb in json.loads(await resp_labels.text()):
-            if lb.get("name", "").startswith("unresolved-conversations"):
+        current_labels = json.loads(await resp_labels.text())
+        for lb in current_labels:
+            if lb["name"].startswith("unresolved-conversations"):
                 await github_api(
                     "DELETE",
                     f"/repos/{owner}/{repo}/issues/{number}/labels/{quote(lb['name'], safe='')}",
@@ -193,10 +391,11 @@ async def check_unresolved_conversations(payload, token):
                 )
 
     label = f"unresolved-conversations: {unresolved_count}"
+
     if unresolved:
-        await _ensure_label_exists(owner, repo, label, "e74c3c", token)
+        await _ensure_label_exists(owner, repo, label, "e74c3c", token)  # Red
     else:
-        await _ensure_label_exists(owner, repo, label, "5cb85c", token)
+        await _ensure_label_exists(owner, repo, label, "5cb85c", token)  # Green
 
     await github_api(
         "POST",
@@ -204,6 +403,107 @@ async def check_unresolved_conversations(payload, token):
         token,
         {"labels": [label]},
     )
+
+    # Create or update a check run that fails when there are unresolved conversations.
+    noun = "conversation" if unresolved_count == 1 else "conversations"
+    if head_sha:
+        if unresolved:
+            check_title = f"{unresolved_count} unresolved {noun}"
+            check_summary = (
+                f"There {'is' if unresolved_count == 1 else 'are'} {unresolved_count} "
+                f"unresolved review {noun} that must be resolved before merging."
+            )
+            check_conclusion = "failure"
+        else:
+            check_title = "All conversations resolved"
+            check_summary = "All review conversations have been resolved."
+            check_conclusion = "success"
+
+        update_payload = build_update_check_run_payloads(
+            status="completed",
+            title=check_title,
+            summary=check_summary,
+            conclusion=check_conclusion,
+        )[0]
+
+        # Reuse an existing check run for this SHA/name to avoid creating
+        # multiple redundant check runs when called from different event types.
+        existing_check_run_id = None
+        resp_check_runs = await github_api(
+            "GET",
+            f"/repos/{owner}/{repo}/commits/{head_sha}/check-runs",
+            token,
+        )
+        if resp_check_runs.status == 200:
+            resp_data = json.loads(await resp_check_runs.text())
+            for check_run in resp_data.get("check_runs", []):
+                if check_run.get("name") == UNRESOLVED_CONVERSATIONS_CHECK_NAME:
+                    existing_check_run_id = check_run.get("id")
+                    break
+
+        if existing_check_run_id is not None:
+            await github_api(
+                "PATCH",
+                f"/repos/{owner}/{repo}/check-runs/{existing_check_run_id}",
+                token,
+                update_payload,
+            )
+        else:
+            await github_api(
+                "POST",
+                f"/repos/{owner}/{repo}/check-runs",
+                token,
+                {"name": UNRESOLVED_CONVERSATIONS_CHECK_NAME, "head_sha": head_sha, **update_payload},
+            )
+
+    # Post or update a comment when there are unresolved conversations; remove
+    # it once all conversations are resolved.
+    marker = UNRESOLVED_CONVERSATIONS_MARKER
+    existing_comment_id = None
+    page = 1
+    while True:
+        resp_comments = await github_api(
+            "GET",
+            f"/repos/{owner}/{repo}/issues/{number}/comments?per_page=100&page={page}",
+            token,
+        )
+        if resp_comments.status != 200:
+            break
+        comments = json.loads(await resp_comments.text())
+        if not comments:
+            break
+        for comment in comments:
+            if marker in comment.get("body", ""):
+                existing_comment_id = comment["id"]
+                break
+        if existing_comment_id is not None:
+            break
+        page += 1
+
+    if unresolved:
+        pr_author_login = (pr.get("user") or {}).get("login", "")
+        username_block = f"@{pr_author_login}\n\n" if pr_author_login else ""
+        comment_body = (
+            f"{marker}\n"
+            f"{username_block}⚠️ This pull request has **{unresolved_count} unresolved review "
+            f"{noun}** that must be resolved before merging."
+        )
+        if existing_comment_id is not None:
+            await github_api(
+                "PATCH",
+                f"/repos/{owner}/{repo}/issues/comments/{existing_comment_id}",
+                token,
+                {"body": comment_body},
+            )
+        else:
+            await create_comment(owner, repo, number, comment_body, token)
+    elif existing_comment_id is not None:
+        # All conversations resolved — remove the warning comment.
+        await github_api(
+            "DELETE",
+            f"/repos/{owner}/{repo}/issues/comments/{existing_comment_id}",
+            token,
+        )
 
 
 # Cloudflare Workers entry point
@@ -213,15 +513,13 @@ async def on_fetch(request, env) -> Response:
     method = request.method
     path = "/" + "/".join(url.split("//", 1)[-1].split("/")[1:]).split("?")[0]
 
-    # Allow requests from GitHub domains for CORS when making client-side requests from the GitHub UI (e.g., from comment forms)
-    headers = Headers.new([
-        ["Access-Control-Allow-Origin", "*"],
-        ["Access-Control-Allow-Methods", "GET, POST, OPTIONS"],
-        ["Access-Control-Allow-Headers", "Content-Type"]
-    ])
-
     if request.method == "OPTIONS":
-        return Response.new("", headers=headers, status=204)
+        cors_headers = Headers.new([
+            ["Access-Control-Allow-Origin", "*"],
+            ["Access-Control-Allow-Methods", "GET, POST, OPTIONS"],
+            ["Access-Control-Allow-Headers", "Content-Type"]
+        ])
+        return Response.new("", headers=cors_headers, status=204)
 
     if path == "/logo-sm.png" or path.endswith("logo-sm.png"):
         return await env.ASSETS.fetch(request)
@@ -281,7 +579,8 @@ async def on_fetch(request, env) -> Response:
                 "checks": {
                     "webhook_security": webhook_security,
                 },
-            }
+            },
+            allow_cors=True,
         )
 
     if method == "POST" and path == "/api/mentors":

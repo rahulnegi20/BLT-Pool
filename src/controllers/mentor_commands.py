@@ -82,6 +82,14 @@ async def _assign_mentor_to_issue(
         {"labels": [MENTOR_ASSIGNED_LABEL]},
     )
 
+    # Add the mentor as a GitHub assignee.
+    await github_api(
+        "POST",
+        f"/repos/{owner}/{repo}/issues/{issue_number}/assignees",
+        token,
+        {"assignees": [mentor_username]},
+    )
+
     specialties_info = ""
     if mentor.get("specialties"):
         specialties_info = f" (specialties: {', '.join(mentor['specialties'])})"
@@ -182,15 +190,19 @@ async def handle_mentor_unassign(
     issue_author = (issue.get("user") or {}).get("login", "")
     is_issue_author = login.lower() == issue_author.lower()
     is_assigned_mentor = current_mentor and login.lower() == current_mentor.lower()
-    if not is_issue_author and not is_assigned_mentor:
+    issue_assignee_logins = {
+        (a.get("login") or "").lower() for a in (issue.get("assignees") or [])
+    }
+    is_current_assignee = login.lower() in issue_assignee_logins
+    if not is_issue_author and not is_assigned_mentor and not is_current_assignee:
         is_repo_maintainer = await _is_maintainer(owner, repo, login, token)
         if not is_repo_maintainer:
             await create_comment(
                 owner,
                 repo,
                 issue_number,
-                f"@{login} Only the issue author, the assigned mentor, or a repo maintainer "
-                "can remove a mentor assignment. "
+                f"@{login} Only the issue author, a current assignee, the assigned mentor, "
+                "or a repo maintainer can remove a mentor assignment. "
                 "Use `/rematch` if you'd like a different mentor.\n\n"
                 "— [OWASP BLT-Pool](https://pool.owaspblt.org)",
                 token,

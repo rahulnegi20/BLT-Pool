@@ -39,6 +39,8 @@ _GH_USERNAME_RE = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,37}[a-zA-Z0-9])?$"
 _SPECIALTY_RE = re.compile(r"^[a-z0-9][a-z0-9+#.\-]{0,29}$")
 _NAME_RE = re.compile(r"^[^<>&\"\x00-\x1f]{1,100}$")
 _TIMEZONE_RE = re.compile(r"^[^<>&\"\x00-\x1f]{1,60}$")
+_TITLE_RE = re.compile(r"^[^<>&\"\x00-\x1f]{1,120}$")
+_BIO_RE = re.compile(r"^[^<>&\"\x00-\x1f]{1,500}$")
 _MENTOR_MIN_MENTEES_CAP = 1
 _MENTOR_MAX_MENTEES_CAP = 10
 
@@ -114,6 +116,8 @@ async def _d1_add_mentor(
     active: bool = True,
     timezone: str = "",
     referred_by: str = "",
+    title: str = "",
+    bio: str = "",
 ) -> None:
     """Insert or replace a mentor row in the D1 ``mentors`` table."""
     await _d1_run(
@@ -550,30 +554,40 @@ async def _get_last_human_activity_ts(
 ) -> float:
     """Return the timestamp (epoch seconds) of the most recent non-bot activity.
 
-    Fetches the most recently created page of issue comments and returns the
-    timestamp of the latest comment posted by a non-bot human.  If no human
-    comments are found the issue's ``created_at`` value is used as a fallback so
-    that newly opened issues without any comments are still eligible for stale
-    checks after ``MENTOR_STALE_DAYS`` days.
+    Fetches issue comments and returns the timestamp of the latest comment
+    posted by a non-bot human. Paginates through all comment pages until a human
+    comment is found. If no human comments are found the issue's ``created_at`` 
+    value is used as a fallback so that newly opened issues without any comments 
+    are still eligible for stale checks after ``MENTOR_STALE_DAYS`` days.
     """
     fallback = _parse_github_timestamp(issue.get("created_at", "")) or 0.0
 
-    resp = await github_api(
-        "GET",
-        f"/repos/{owner}/{repo}/issues/{issue_number}/comments"
-        f"?sort=created&direction=desc&per_page=100",
-        token,
-    )
-    if resp.status != 200:
-        return fallback
+    page = 1
+    per_page = 100
+    while True:
+        resp = await github_api(
+            "GET",
+            f"/repos/{owner}/{repo}/issues/{issue_number}/comments"
+            f"?sort=created&direction=desc&per_page={per_page}&page={page}",
+            token,
+        )
+        if resp.status != 200:
+            return fallback
 
-    comments = json.loads(await resp.text())
-    for comment in comments:
-        user = comment.get("user") or {}
-        if _is_human(user) and not _is_bot(user):
-            ts = _parse_github_timestamp(comment.get("created_at", ""))
-            if ts:
-                return ts
+        comments = json.loads(await resp.text())
+        if not comments:
+            break
+
+        for comment in comments:
+            user = comment.get("user") or {}
+            if _is_human(user) and not _is_bot(user):
+                ts = _parse_github_timestamp(comment.get("created_at", ""))
+                if ts:
+                    return ts
+
+        if len(comments) < per_page:
+            break
+        page += 1
 
     return fallback
 

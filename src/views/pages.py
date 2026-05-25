@@ -167,6 +167,8 @@ def _generate_mentor_row(mentor: dict, stats: Optional[dict] = None, current_loa
     max_mentees = mentor.get("max_mentees", 3)
     timezone = mentor.get("timezone", "")
     active = mentor.get("active", True)
+    title = _html_mod.escape(mentor.get("title", "") or "")
+    bio = _html_mod.escape(mentor.get("bio", "") or "")
 
     avatar_url = (
         f"https://github.com/{github}.png"
@@ -196,9 +198,13 @@ def _generate_mentor_row(mentor: dict, stats: Optional[dict] = None, current_loa
 
     tz_cell = f'<span class="text-xs text-gray-500">{_html_mod.escape(timezone)}</span>' if timezone else '<span class="text-xs text-gray-400">—</span>'
 
+    title_html = f'<p class="text-xs text-gray-500 mt-0.5">{title}</p>' if title else ""
+    bio_html = f'<p class="text-xs text-gray-400 mt-1">{bio}</p>' if bio else ""
+
     # Stats cells — shown when D1 data is available.
-    if stats:
-        merged_prs = int(stats.get("merged_prs") or 0)
+    if stats is not None:
+        # Fall back to mentor's own total_prs if stats dict doesn't have merged_prs
+        merged_prs = int(stats.get("merged_prs") if "merged_prs" in stats else mentor.get("total_prs", 0))
         reviews = int(stats.get("reviews") or 0)
         stats_desktop = (
             f'<div class="text-center">'
@@ -230,6 +236,8 @@ def _generate_mentor_row(mentor: dict, stats: Optional[dict] = None, current_loa
         <div class="hidden sm:grid {desktop_cols} sm:items-center sm:gap-4">
           <div class="min-w-0">
             <p class="truncate font-semibold text-[#111827] text-sm">{name}</p>
+            {title_html}
+            {bio_html}
             <div class="mt-0.5 flex flex-wrap gap-1">{specialty_chips}</div>
           </div>
           <div>{status_badge}</div>
@@ -247,6 +255,8 @@ def _generate_mentor_row(mentor: dict, stats: Optional[dict] = None, current_loa
             <p class="truncate font-semibold text-[#111827] text-sm">{name}</p>
             <div class="shrink-0">{github_link}</div>
           </div>
+          {title_html}
+          {bio_html}
           <div class="mt-0.5 flex flex-wrap gap-1">{specialty_chips}</div>
           <div class="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1">
             {status_badge}
@@ -873,14 +883,14 @@ def _index_html(mentors: list = None, mentor_stats: Optional[dict] = None, activ
 </body>
 </html>'''
 
-def _json(data, status: int = 200) -> Response:
+def _json(data, status: int = 200, allow_cors: bool = False) -> Response:
+    headers_list = [["Content-Type", "application/json"]]
+    if allow_cors:
+        headers_list.append(["Access-Control-Allow-Origin", "*"])
     return Response.new(
         json.dumps(data),
         status=status,
-        headers=Headers.new([
-            ["Content-Type", "application/json"],
-            ["Access-Control-Allow-Origin", "*"],
-        ]),
+        headers=Headers.new(headers_list),
     )
 
 def _html(html: str, status: int = 200) -> Response:

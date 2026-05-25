@@ -4,7 +4,7 @@ import re
 from js import fetch, Headers, console
 from views.pages import _json
 from services.admin import has_merged_pr_in_org
-from models.mentor import _d1_add_mentor, _NAME_RE, _GH_USERNAME_RE, _SPECIALTY_RE, _TIMEZONE_RE, _MENTOR_MIN_MENTEES_CAP, _MENTOR_MAX_MENTEES_CAP
+from models.mentor import _d1_add_mentor, _NAME_RE, _GH_USERNAME_RE, _SPECIALTY_RE, _TIMEZONE_RE, _TITLE_RE, _BIO_RE, _MENTOR_MIN_MENTEES_CAP, _MENTOR_MAX_MENTEES_CAP
 from models.leaderboard import _ensure_leaderboard_schema, _reset_leaderboard_month
 from core.github_client import _gh_headers, github_api
 from core.db import _d1_binding, _d1_all
@@ -54,6 +54,8 @@ async def _handle_add_mentor(request, env) -> "Response":
     max_mentees = body.get("max_mentees", 3)
     timezone = (body.get("timezone") or "").strip()
     referred_by = (body.get("referred_by") or "").strip().lstrip("@")
+    title = (body.get("title") or "").strip()
+    bio = (body.get("bio") or "").strip()
 
     if not name:
         return _json({"error": "Field 'name' is required"}, 400)
@@ -87,6 +89,12 @@ async def _handle_add_mentor(request, env) -> "Response":
 
     if timezone and not _TIMEZONE_RE.match(timezone):
         return _json({"error": "Timezone contains invalid characters (HTML and scripting are not allowed)"}, 400)
+
+    if title and not _TITLE_RE.match(title):
+        return _json({"error": "Title contains invalid characters (HTML and scripting are not allowed)"}, 400)
+
+    if bio and not _BIO_RE.match(bio):
+        return _json({"error": "Bio contains invalid characters (HTML and scripting are not allowed)"}, 400)
 
     if referred_by and not _GH_USERNAME_RE.match(referred_by):
         return _json({"error": "Invalid referred_by username format"}, 400)
@@ -129,6 +137,8 @@ async def _handle_add_mentor(request, env) -> "Response":
             active=mentor_is_active,
             timezone=timezone,
             referred_by=referred_by,
+            title=title,
+            bio=bio,
         )
     except Exception as exc:
         import traceback; traceback.print_exc()
